@@ -1,4 +1,0 @@
-  Determining projects to restore...
-  All projects are up-to-date for restore.
-  Gemma3.Sharp -> /app/Gemma3.Sharp/bin/Debug/net10.0/Gemma3.Sharp.dll
-/app/Gemma3.Sharp.Tests/KernelTests.cs(7,25): error CS0227: Unsafe code may only appear if compiling with /unsafe [/app/Gemma3.Sharp.Tests/Gemma3.Sharp.Tests.csproj]

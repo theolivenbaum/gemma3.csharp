@@ -1,4 +1,0 @@
-  Determining projects to restore...
-  All projects are up-to-date for restore.
-/app/Gemma3.Sharp/Kernels.cs(64,49): error CS0029: Cannot implicitly convert type 'System.Runtime.Intrinsics.Vector256<int>' to 'System.Runtime.Intrinsics.Vector256<uint>' [/app/Gemma3.Sharp/Gemma3.Sharp.csproj]
-/app/Gemma3.Sharp/Kernels.cs(65,50): error CS0029: Cannot implicitly convert type 'System.Runtime.Intrinsics.Vector256<int>' to 'System.Runtime.Intrinsics.Vector256<uint>' [/app/Gemma3.Sharp/Gemma3.Sharp.csproj]
