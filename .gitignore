@@ -1,1 +1,5 @@
-gemma-3-4b-it/
+bin/
+obj/
+.vs/
+*.user
+*.suo

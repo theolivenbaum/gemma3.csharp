@@ -1,0 +1,17 @@
+  Determining projects to restore...
+  All projects are up-to-date for restore.
+/app/Gemma3.Sharp/Transformer.cs(87,17): warning CS8602: Dereference of a possibly null reference. [/app/Gemma3.Sharp/Gemma3.Sharp.csproj]
+/app/Gemma3.Sharp/Transformer.cs(309,30): warning CS8602: Dereference of a possibly null reference. [/app/Gemma3.Sharp/Gemma3.Sharp.csproj]
+/app/Gemma3.Sharp/Transformer.cs(398,27): warning CS8602: Dereference of a possibly null reference. [/app/Gemma3.Sharp/Gemma3.Sharp.csproj]
+  Gemma3.Sharp -> /app/Gemma3.Sharp/bin/Debug/net10.0/Gemma3.Sharp.dll
+  Gemma3.Sharp.Tests -> /app/Gemma3.Sharp.Tests/bin/Debug/net10.0/Gemma3.Sharp.Tests.dll
+
+Build succeeded.
+
+/app/Gemma3.Sharp/Transformer.cs(87,17): warning CS8602: Dereference of a possibly null reference. [/app/Gemma3.Sharp/Gemma3.Sharp.csproj]
+/app/Gemma3.Sharp/Transformer.cs(309,30): warning CS8602: Dereference of a possibly null reference. [/app/Gemma3.Sharp/Gemma3.Sharp.csproj]
+/app/Gemma3.Sharp/Transformer.cs(398,27): warning CS8602: Dereference of a possibly null reference. [/app/Gemma3.Sharp/Gemma3.Sharp.csproj]
+    3 Warning(s)
+    0 Error(s)
+
+Time Elapsed 00:00:02.68

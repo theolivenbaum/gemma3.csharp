@@ -1,0 +1,13 @@
+  Determining projects to restore...
+  All projects are up-to-date for restore.
+/app/Gemma3.Sharp/Transformer.cs(100,26): warning CS8625: Cannot convert null literal to non-nullable reference type. [/app/Gemma3.Sharp/Gemma3.Sharp.csproj]
+  Gemma3.Sharp -> /app/Gemma3.Sharp/bin/Debug/net10.0/Gemma3.Sharp.dll
+  Gemma3.Sharp.Tests -> /app/Gemma3.Sharp.Tests/bin/Debug/net10.0/Gemma3.Sharp.Tests.dll
+
+Build succeeded.
+
+/app/Gemma3.Sharp/Transformer.cs(100,26): warning CS8625: Cannot convert null literal to non-nullable reference type. [/app/Gemma3.Sharp/Gemma3.Sharp.csproj]
+    1 Warning(s)
+    0 Error(s)
+
+Time Elapsed 00:00:05.29
