@@ -49,49 +49,53 @@ namespace Gemma3.Sharp
             _transformer.Cache.Reset();
 
             var sb = new StringBuilder();
-
-            // Prefill
             float* logits = _transformer.Buffers.Logits;
-            int pos = 0;
+            int vocabSize = _transformer.Config.VocabSize;
 
-            for (int i = 0; i < tokens.Length - 1; i++)
-            {
-                _transformer.Forward(logits, tokens[i], pos++);
-            }
+            if (tokens.Length == 0) return "";
 
-            int nextToken = tokens[tokens.Length - 1];
+            // Prefill full prompt
+            _transformer.Prefill(logits, tokens, 0);
+            int pos = _transformer.Cache.CurrentPos;
+
+            int nextToken = 0;
 
             for (int i = 0; i < params_.MaxTokens; i++)
             {
-                _transformer.Forward(logits, nextToken, pos++);
-
-                // Sample
-                // Apply temp
+                // Sampling Pipeline
+                // 1. Temp
                 if (params_.Temperature > 0)
                 {
-                    for(int j=0; j<Gemma3Config.Default.VocabSize; j++) logits[j] /= params_.Temperature;
+                    float invTemp = 1.0f / params_.Temperature;
+                    Kernels.VecScale(logits, logits, invTemp, vocabSize);
                 }
 
-                // Softmax
-                Kernels.Softmax(logits, Gemma3Config.Default.VocabSize);
+                // 2. TopK
+                if (params_.TopK > 0) Kernels.SampleTopK(logits, vocabSize, params_.TopK);
 
-                // TopK
-                if (params_.TopK > 0) Kernels.SampleTopK(logits, Gemma3Config.Default.VocabSize, params_.TopK);
+                // 3. TopP
+                if (params_.TopP < 1.0f) Kernels.SampleTopP(logits, vocabSize, params_.TopP);
 
-                // TopP
-                if (params_.TopP < 1.0f) Kernels.SampleTopP(logits, Gemma3Config.Default.VocabSize, params_.TopP);
+                // 4. Softmax (Logits -> Probs)
+                Kernels.Softmax(logits, vocabSize);
 
-                // Sample
+                // 5. Sample
                 if (params_.Temperature <= 0)
-                    nextToken = Kernels.ArgMax(logits, Gemma3Config.Default.VocabSize);
+                    nextToken = Kernels.ArgMax(logits, vocabSize);
                 else
-                    nextToken = Kernels.Sample(logits, Gemma3Config.Default.VocabSize);
+                    nextToken = Kernels.Sample(logits, vocabSize);
 
                 if (nextToken == _tokenizer.EosId || nextToken == _tokenizer.EndTurnId) break;
 
                 string piece = _tokenizer.Decode(new[] { nextToken });
                 sb.Append(piece);
                 onToken?.Invoke(piece);
+
+                // Forward next token
+                if (i < params_.MaxTokens - 1)
+                {
+                    _transformer.Forward(logits, nextToken, pos++);
+                }
             }
 
             return sb.ToString();

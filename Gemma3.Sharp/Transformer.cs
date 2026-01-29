@@ -170,25 +170,9 @@ namespace Gemma3.Sharp
             int hiddenSize = Config.HiddenSize;
             int vocabSize = Config.VocabSize;
 
-            // Embedding
-            // Note: Weights are ReadOnlySpan<ushort>. We need pointer.
-            // But Span cannot be converted to pointer easily unless fixed.
-            // But the Weights class uses MappedFile pointers internally but exposes Spans.
-            // We should modify Weights to expose pointers or use fixed on spans (which works if they are backed by unmanaged memory, but Spans from MappedViewAccessor are).
-            // Actually, the easiest way is to modify Kernels to accept ReadOnlySpan or just unsafe pointers.
-            // But Kernels use pointers.
-            // So we need to get pointers from Weights.
-
-            // Let's assume we can get pointers. I'll use fixed statement on Spans.
-            // Wait, you can only use fixed on managed arrays or strings or fixed size buffers, OR on spans that refer to pinned memory.
-            // The spans from SafeTensors are backed by unmanaged memory (pointers).
-            // So `fixed` might not work directly or it might simply work if I use `GetPinnableReference`?
-            // Actually `fixed (ushort* ptr = span)` works for unmanaged-backed spans too in recent C#.
-
             // Embed
             fixed (ushort* wEmbed = Weights.EmbedTokens)
             {
-                // We implement specialized kernel for embedding row copy
                 ushort* row = wEmbed + tokenId * hiddenSize;
                 float* x = Buffers.X;
                 for(int i=0; i<hiddenSize; i++) x[i] = Kernels.BF16ToFloat(row[i]);
@@ -196,7 +180,7 @@ namespace Gemma3.Sharp
 
             // Scale
             float scale = MathF.Sqrt(hiddenSize);
-            for(int i=0; i<hiddenSize; i++) Buffers.X[i] *= scale;
+            Kernels.VecScale(Buffers.X, Buffers.X, scale, hiddenSize);
 
             // Layers
             for(int l=0; l<Config.NumLayers; l++)
@@ -220,25 +204,14 @@ namespace Gemma3.Sharp
                     LayerAttention(l, pos, wQ, wK, wV, wO, wQNorm, wKNorm);
                 }
 
-                // Post-Attn Norm
+                // Post-Attn Norm (In-place on ProjOut)
                 fixed (ushort* wPostAttnLn = layer.PostAttentionLayernorm)
                 {
-                     // In-place RMSNorm
-                     // Kernels.RMSNorm(Buffers.ProjOut, Buffers.ProjOut, wPostAttnLn, ...)
-                     // Wait, C code does inplace on proj_out.
-                     // But we have ProjOut separately.
-                     // C: gemma3_rmsnorm_bf16_inplace(buf->proj_out, ...)
-
-                     // We can implement inplace RMSNorm in Kernels or just use separate buffer.
-                     // Let's just use XNorm buffer as temp if needed, or implement inplace.
-                     // I'll implement explicit inplace call here:
-                     float* ptr = Buffers.ProjOut;
-                     // Manual inline or helper
-                     Kernels.RMSNorm(ptr, ptr, wPostAttnLn, hiddenSize, Config.RmsNormEps);
+                     Kernels.RMSNorm(Buffers.ProjOut, Buffers.ProjOut, wPostAttnLn, hiddenSize, Config.RmsNormEps);
                 }
 
                 // Residual X += ProjOut
-                for(int i=0; i<hiddenSize; i++) Buffers.X[i] += Buffers.ProjOut[i];
+                Kernels.VecAdd(Buffers.X, Buffers.X, Buffers.ProjOut, hiddenSize);
 
                 // MLP Block
                 // Pre-FF Norm
@@ -254,14 +227,14 @@ namespace Gemma3.Sharp
                     LayerMlp(l, wGate, wUp, wDown);
                 }
 
-                // Post-FF Norm
+                // Post-FF Norm (In-place on MlpOut)
                 fixed (ushort* wPostFfLn = layer.PostFeedforwardLayernorm)
                 {
                     Kernels.RMSNorm(Buffers.MlpOut, Buffers.MlpOut, wPostFfLn, hiddenSize, Config.RmsNormEps);
                 }
 
                 // Residual X += MlpOut
-                for(int i=0; i<hiddenSize; i++) Buffers.X[i] += Buffers.MlpOut[i];
+                Kernels.VecAdd(Buffers.X, Buffers.X, Buffers.MlpOut, hiddenSize);
             }
 
             // Final Norm
@@ -275,6 +248,37 @@ namespace Gemma3.Sharp
             {
                 Kernels.MatVec(logits, wEmbed, Buffers.XNorm, vocabSize, hiddenSize);
             }
+        }
+
+        public void Prefill(float* logits, int[] tokens, int startPos)
+        {
+            // Process tokens sequentially for now
+            // We use Buffers.Logits as temp space if needed, but for the last token we output to logits ptr.
+            // Actually, we can just call Forward for each token.
+            // If caller provides 'logits', they usually want logits for the *last* token only (next token prediction).
+            // But we can optimize to not compute full logits for intermediate tokens if we want,
+            // but Forward currently always computes them.
+            // To optimize, Forward should take a flag or we should have a separate method.
+            // The C implementation computes logits for intermediate tokens into buf->logits (temp) but ignores them.
+
+            for (int i = 0; i < tokens.Length; i++)
+            {
+                int pos = startPos + i;
+                bool isLast = (i == tokens.Length - 1);
+
+                if (isLast)
+                {
+                    Forward(logits, tokens[i], pos);
+                }
+                else
+                {
+                    // Compute into temp buffer (Buffers.Logits) to avoid writing to output logits if it points to same place
+                    // But Forward writes to 'logits' arg.
+                    // We can reuse Buffers.Logits as scratch.
+                    Forward(Buffers.Logits, tokens[i], pos);
+                }
+            }
+            Cache.CurrentPos = startPos + tokens.Length;
         }
 
         private void LayerAttention(int l, int pos, ushort* wQ, ushort* wK, ushort* wV, ushort* wO, ushort* wQNorm, ushort* wKNorm)
@@ -314,78 +318,37 @@ namespace Gemma3.Sharp
              if (isGlobal)
              {
                  seqLen = pos + 1;
-                 // Causal mask
-                 for(int i=0; i<seqLen; i++) Buffers.Mask[i] = 0.0f; // Simplified causal mask (all prev tokens valid)
-                 // Note: Actual causal mask requires -inf for future tokens if we compute for multiple tokens.
-                 // But here we compute for 1 token 'pos'. It attends to 0..pos.
-                 // So the mask is all zeros for 0..pos.
+                 // Causal mask: 0 for all valid positions
+                 Kernels.VecZero(Buffers.Mask, seqLen);
              }
              else
              {
                  int window = Config.SlidingWindow;
                  seqLen = (pos < window) ? pos + 1 : window;
-                 // Sliding window mask: all valid in window
-                 for(int i=0; i<seqLen; i++) Buffers.Mask[i] = 0.0f;
+                 // Sliding window mask: 0 for all valid positions
+                 Kernels.VecZero(Buffers.Mask, seqLen);
              }
 
              // GQA
              float scale = 1.0f / MathF.Sqrt(headDim);
 
-             // We need to implement GQA in Kernels or here.
-             // C implementation has `gemma3_gqa`.
-             // I'll implement it inline here using loops and helper from Kernels?
-             // Or better, add GQA to Kernels.
-             // For now, I'll implement it here using loop.
-
-             int headsPerGroup = numHeads / numKVHeads;
-
-             for(int h=0; h<numHeads; h++)
-             {
-                 int kvHead = h / headsPerGroup;
-                 float* qHead = Buffers.Q + h * headDim;
-                 float* outHead = Buffers.AttnOut + h * headDim;
-
-                 // Scores
-                 // kCache is [seqLen, kvHeads, headDim] (interleaved)
-                 // Or [layer][pos * kvSize + kvHead * headDim] ?
-                 // My CacheKV impl puts it linearly:
-                 // cache_pos * kvSize + ...
-                 // So stride between positions is kvSize.
-
-                 for(int t=0; t<seqLen; t++)
-                 {
-                     float* kPos = kCache + t * kvSize + kvHead * headDim;
-
-                     // Dot product qHead . kPos
-                     // Simple float dot
-                     float score = 0.0f;
-                     for(int d=0; d<headDim; d++) score += qHead[d] * kPos[d];
-                     score *= scale;
-
-                     // Mask (always 0 here for valid positions)
-                     Buffers.Mask[t] += score; // reusing mask buffer for scores? No, separate buffer needed.
-                     // The C code reuses mask buffer or allocs scores buffer.
-                     // "float *scores = (float *)malloc(seq_len * sizeof(float));"
-                     // I should use a temp buffer. I have Buffers.Mask but that's for mask values.
-                     // I can use Buffers.Mask as temp score buffer since I just computed it to be 0.
-                     // So Buffers.Mask[t] = score.
-
-                     Buffers.Mask[t] = score;
-                 }
-
-                 // Softmax on Mask (which now holds scores)
-                 Kernels.Softmax(Buffers.Mask, seqLen);
-
-                 // Weighted sum
-                 for(int d=0; d<headDim; d++) outHead[d] = 0.0f;
-
-                 for(int t=0; t<seqLen; t++)
-                 {
-                     float w = Buffers.Mask[t];
-                     float* vPos = vCache + t * kvSize + kvHead * headDim;
-                     for(int d=0; d<headDim; d++) outHead[d] += w * vPos[d];
-                 }
-             }
+             Kernels.GQA(
+                 Buffers.AttnOut,
+                 Buffers.Q,
+                 kCache,
+                 vCache,
+                 Buffers.Mask, // scores_buf. Scratch space for scores.
+                               // Note: GQA takes 'scores_buf' as scratch, and 'mask' as optional input.
+                               // Since for single token generation, the mask is effectively all zeros (all context is valid).
+                               // So we can pass mask=null to GQA.
+                               // And use Buffers.Mask as 'scores_buf'.
+                 numHeads,
+                 numKVHeads,
+                 headDim,
+                 seqLen,
+                 scale,
+                 null // mask is all zeros, so we can pass null to optimize
+             );
 
              // Output Proj
              Kernels.MatVec(Buffers.ProjOut, wO, Buffers.AttnOut, hiddenSize, qSize);
@@ -398,8 +361,8 @@ namespace Gemma3.Sharp
             float* kDst = Cache.Layers[l].K + cachePos * kvSize;
             float* vDst = Cache.Layers[l].V + cachePos * kvSize;
 
-            Buffer.MemoryCopy(k, kDst, kvSize * sizeof(float), kvSize * sizeof(float));
-            Buffer.MemoryCopy(v, vDst, kvSize * sizeof(float), kvSize * sizeof(float));
+            Kernels.VecCopy(kDst, k, kvSize);
+            Kernels.VecCopy(vDst, v, kvSize);
 
             Cache.Layers[l].Pos = pos + 1;
         }
@@ -414,7 +377,7 @@ namespace Gemma3.Sharp
 
             // SwiGLU: GELU(gate) * up
             Kernels.GELU(Buffers.MlpGate, intermediateSize);
-            for(int i=0; i<intermediateSize; i++) Buffers.MlpGate[i] *= Buffers.MlpUp[i];
+            Kernels.VecMul(Buffers.MlpGate, Buffers.MlpGate, Buffers.MlpUp, intermediateSize);
 
             Kernels.MatVec(Buffers.MlpOut, wDown, Buffers.MlpGate, hiddenSize, intermediateSize);
         }

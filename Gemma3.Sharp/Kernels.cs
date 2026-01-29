@@ -1,4 +1,5 @@
 using System;
+using System.Runtime.InteropServices;
 using System.Runtime.CompilerServices;
 using System.Runtime.Intrinsics;
 using System.Runtime.Intrinsics.X86;
@@ -14,6 +15,73 @@ namespace Gemma3.Sharp
         {
             uint bits = (uint)bf16 << 16;
             return BitConverter.UInt32BitsToSingle(bits);
+        }
+
+        public static void VecAdd(float* y, float* a, float* b, int n)
+        {
+            int i = 0;
+            if (Avx.IsSupported)
+            {
+                for (; i <= n - 8; i += 8)
+                {
+                    Vector256<float> va = Vector256.Load(a + i);
+                    Vector256<float> vb = Vector256.Load(b + i);
+                    Vector256<float> vy = Avx.Add(va, vb);
+                    vy.Store(y + i);
+                }
+            }
+            for (; i < n; i++)
+            {
+                y[i] = a[i] + b[i];
+            }
+        }
+
+        public static void VecMul(float* y, float* a, float* b, int n)
+        {
+            int i = 0;
+            if (Avx.IsSupported)
+            {
+                for (; i <= n - 8; i += 8)
+                {
+                    Vector256<float> va = Vector256.Load(a + i);
+                    Vector256<float> vb = Vector256.Load(b + i);
+                    Vector256<float> vy = Avx.Multiply(va, vb);
+                    vy.Store(y + i);
+                }
+            }
+            for (; i < n; i++)
+            {
+                y[i] = a[i] * b[i];
+            }
+        }
+
+        public static void VecScale(float* y, float* x, float scale, int n)
+        {
+            int i = 0;
+            if (Avx.IsSupported)
+            {
+                Vector256<float> vScale = Vector256.Create(scale);
+                for (; i <= n - 8; i += 8)
+                {
+                    Vector256<float> vx = Vector256.Load(x + i);
+                    Vector256<float> vy = Avx.Multiply(vx, vScale);
+                    vy.Store(y + i);
+                }
+            }
+            for (; i < n; i++)
+            {
+                y[i] = x[i] * scale;
+            }
+        }
+
+        public static void VecCopy(float* dst, float* src, int n)
+        {
+            Buffer.MemoryCopy(src, dst, n * sizeof(float), n * sizeof(float));
+        }
+
+        public static void VecZero(float* x, int n)
+        {
+            NativeMemory.Clear(x, (nuint)(n * sizeof(float)));
         }
 
         // MatVec: y = A * x
@@ -99,18 +167,174 @@ namespace Gemma3.Sharp
         public static void RMSNorm(float* y, float* x, ushort* w, int n, float eps)
         {
             float ss = 0.0f;
-            for (int i = 0; i < n; i++)
+            int i = 0;
+
+            if (Avx.IsSupported)
+            {
+                Vector256<float> sumVec = Vector256<float>.Zero;
+                for (; i <= n - 8; i += 8)
+                {
+                    Vector256<float> vx = Vector256.Load(x + i);
+                    sumVec = Avx.Add(sumVec, Avx.Multiply(vx, vx));
+                }
+
+                // Reduce sum
+                Vector128<float> vLow = sumVec.GetLower();
+                Vector128<float> vHigh = sumVec.GetUpper();
+                Vector128<float> vSum = Sse.Add(vLow, vHigh);
+                vSum = Sse.Add(vSum, Sse.MoveHighToLow(vSum, vSum));
+                vSum = Sse.Add(vSum, Sse.Shuffle(vSum, vSum, 0x55));
+                ss = vSum.ToScalar();
+            }
+
+            for (; i < n; i++)
             {
                 ss += x[i] * x[i];
             }
+
             ss = ss / n + eps;
             float rsqrt_ss = 1.0f / MathF.Sqrt(ss);
 
-            for (int i = 0; i < n; i++)
+            i = 0;
+            if (Avx2.IsSupported)
             {
-                // Gemma uses (1.0 + weight)
+                Vector256<float> vRsqrt = Vector256.Create(rsqrt_ss);
+                Vector256<float> vOne = Vector256.Create(1.0f);
+
+                for (; i <= n - 16; i += 16)
+                {
+                     // Load weights (BF16)
+                     Vector256<ushort> vw_bf16 = Vector256.Load((ushort*)(w + i));
+
+                     Vector128<ushort> vw_low = vw_bf16.GetLower();
+                     Vector128<ushort> vw_high = vw_bf16.GetUpper();
+
+                     Vector256<uint> vw_low_32 = Avx2.ShiftLeftLogical(Avx2.ConvertToVector256Int32(vw_low).AsUInt32(), 16);
+                     Vector256<uint> vw_high_32 = Avx2.ShiftLeftLogical(Avx2.ConvertToVector256Int32(vw_high).AsUInt32(), 16);
+
+                     Vector256<float> vf_low = vw_low_32.AsSingle();
+                     Vector256<float> vf_high = vw_high_32.AsSingle();
+
+                     // 1.0 + w
+                     vf_low = Avx.Add(vOne, vf_low);
+                     vf_high = Avx.Add(vOne, vf_high);
+
+                     // Load x
+                     Vector256<float> vx_low = Vector256.Load(x + i);
+                     Vector256<float> vx_high = Vector256.Load(x + i + 8);
+
+                     // x * rsqrt * (1+w)
+                     Vector256<float> vy_low = Avx.Multiply(vx_low, vRsqrt);
+                     vy_low = Avx.Multiply(vy_low, vf_low);
+
+                     Vector256<float> vy_high = Avx.Multiply(vx_high, vRsqrt);
+                     vy_high = Avx.Multiply(vy_high, vf_high);
+
+                     vy_low.Store(y + i);
+                     vy_high.Store(y + i + 8);
+                }
+            }
+
+            for (; i < n; i++)
+            {
                 float weight = 1.0f + BF16ToFloat(w[i]);
                 y[i] = x[i] * rsqrt_ss * weight;
+            }
+        }
+
+        public static void GQA(
+            float* out_buf,      // [num_heads * head_dim]
+            float* q,            // [num_heads * head_dim]
+            float* k_cache,      // [seq_len, num_kv_heads, head_dim] (interleaved)
+            float* v_cache,      // [seq_len, num_kv_heads, head_dim] (interleaved)
+            float* scores_buf,   // [seq_len] scratch space
+            int num_heads,
+            int num_kv_heads,
+            int head_dim,
+            int seq_len,
+            float scale,
+            float* mask          // [seq_len] optional mask
+        )
+        {
+            int heads_per_group = num_heads / num_kv_heads;
+            int kv_stride = num_kv_heads * head_dim;
+
+            for (int h = 0; h < num_heads; h++)
+            {
+                int kv_head = h / heads_per_group;
+                float* q_head = q + h * head_dim;
+                float* out_head = out_buf + h * head_dim;
+
+                // 1. Compute Scores
+                for (int t = 0; t < seq_len; t++)
+                {
+                    float* k_ptr = k_cache + t * kv_stride + kv_head * head_dim;
+
+                    // Dot product q_head . k_ptr
+                    float score = 0.0f;
+                    int d = 0;
+                    if (Avx.IsSupported)
+                    {
+                        Vector256<float> sumVec = Vector256<float>.Zero;
+                        for (; d <= head_dim - 8; d += 8)
+                        {
+                            Vector256<float> vq = Vector256.Load(q_head + d);
+                            Vector256<float> vk = Vector256.Load(k_ptr + d);
+                            sumVec = Avx.Add(sumVec, Avx.Multiply(vq, vk));
+                        }
+                        // Reduce
+                        Vector128<float> vLow = sumVec.GetLower();
+                        Vector128<float> vHigh = sumVec.GetUpper();
+                        Vector128<float> vSum = Sse.Add(vLow, vHigh);
+                        vSum = Sse.Add(vSum, Sse.MoveHighToLow(vSum, vSum));
+                        vSum = Sse.Add(vSum, Sse.Shuffle(vSum, vSum, 0x55));
+                        score = vSum.ToScalar();
+                    }
+
+                    for (; d < head_dim; d++) score += q_head[d] * k_ptr[d];
+
+                    score *= scale;
+                    if (mask != null) score += mask[t];
+                    scores_buf[t] = score;
+                }
+
+                // 2. Softmax on scores
+                Softmax(scores_buf, seq_len);
+
+                // 3. Weighted Sum
+                // out_head = sum(scores[t] * v[t])
+                // Initialize out_head to 0
+                int d_out=0;
+                if (Avx.IsSupported)
+                {
+                     Vector256<float> vZero = Vector256<float>.Zero;
+                     for(; d_out <= head_dim - 8; d_out+=8) vZero.Store(out_head + d_out);
+                }
+                for(; d_out < head_dim; d_out++) out_head[d_out] = 0.0f;
+
+                for (int t = 0; t < seq_len; t++)
+                {
+                    float w = scores_buf[t];
+                    float* v_ptr = v_cache + t * kv_stride + kv_head * head_dim;
+
+                    // out_head += w * v_ptr
+                    int d = 0;
+                    if (Avx.IsSupported)
+                    {
+                        Vector256<float> vw = Vector256.Create(w);
+                        for (; d <= head_dim - 8; d += 8)
+                        {
+                            Vector256<float> vo = Vector256.Load(out_head + d);
+                            Vector256<float> vv = Vector256.Load(v_ptr + d);
+                            if (Fma.IsSupported)
+                                vo = Fma.MultiplyAdd(vw, vv, vo);
+                            else
+                                vo = Avx.Add(vo, Avx.Multiply(vw, vv));
+                            vo.Store(out_head + d);
+                        }
+                    }
+                    for (; d < head_dim; d++) out_head[d] += w * v_ptr[d];
+                }
             }
         }
 
